@@ -1,0 +1,62 @@
+[project]
+name = "fitsq"
+version = "0.1.0"
+description = "File-discovery query layer for FITS source catalogs in S3"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "astropy>=6.0",
+    "boto3>=1.34",
+    "duckdb>=1.0",
+    "mocpy>=0.17",
+    "numpy>=1.26",
+    "typer>=0.12",
+]
+
+[project.scripts]
+fitsq = "fitsq.cli:app"
+
+[dependency-groups]
+dev = [
+    "moto[s3]>=5.0",
+    "mypy>=1.10",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fitsq"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["fitsq", "synth"]
+
+[tool.mypy]
+# No python_version pin: numpy's bundled stubs require 3.12+ syntax, so mypy
+# runs against the interpreter in use. The package itself supports 3.11+.
+strict = true
+packages = ["fitsq"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["mocpy.*", "astropy.*", "duckdb.*", "boto3.*", "botocore.*", "moto.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -m 'not slow'"
+markers = ["slow: opt-in tests that read whole catalog files from S3"]
+
+[tool.coverage.run]
+source = ["fitsq"]
