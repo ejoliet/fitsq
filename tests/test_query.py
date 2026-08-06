@@ -11,6 +11,7 @@ from mocpy import MOC
 import synth
 from fitsq.indexer import build_moc, coord_bbox, uncovered
 from fitsq.query import (
+    INDEX_FRAME,
     BBox,
     Index,
     QueryError,
@@ -19,6 +20,9 @@ from fitsq.query import (
     parse_angle,
     parse_stcs,
     polygon_moc,
+    resolve_frame,
+    to_icrs,
+    to_index_frame,
 )
 from fitsq.store import FileRow, Store
 
@@ -26,8 +30,10 @@ ORDER = 9
 
 
 def add_file(store: Store, uri: str, ra: np.ndarray, dec: np.ndarray, dilate: int = 1) -> None:
-    moc = build_moc(ra, dec, ORDER, dilate)
-    ra_min, ra_max, dec_min, dec_max, wraps = coord_bbox(ra, dec)
+    """Index synthetic ICRS rows the way the sampling crawl does (index frame)."""
+    lon, lat = to_index_frame(ra, dec, "icrs")
+    moc = build_moc(lon, lat, ORDER, dilate)
+    lon_min, lon_max, lat_min, lat_max, wraps = coord_bbox(lon, lat)
     store.upsert_file(
         FileRow(
             uri=uri,
@@ -36,11 +42,11 @@ def add_file(store: Store, uri: str, ra: np.ndarray, dec: np.ndarray, dilate: in
             nrows=len(ra),
             row_bytes=91,
             data_offset=5760,
-            ra_min=ra_min,
-            ra_max=ra_max,
-            dec_min=dec_min,
-            dec_max=dec_max,
-            ra_wraps=wraps,
+            lon_min=lon_min,
+            lon_max=lon_max,
+            lat_min=lat_min,
+            lat_max=lat_max,
+            lon_wraps=wraps,
             moc_json=moc.to_string(format="json"),
         )
     )
@@ -80,6 +86,67 @@ def test_parse_stcs_rejects_unsupported() -> None:
         parse_stcs("   ", ORDER)
 
 
+def test_to_icrs_galactic_known_value() -> None:
+    """l=3.45 b=-0.27 is ICRS (268.66289, -26.11349) — the Roman bulge field."""
+    ra, dec = to_icrs(3.45, -0.27, "galactic")
+    assert ra[0] == pytest.approx(268.66289, abs=1e-4)
+    assert dec[0] == pytest.approx(-26.11349, abs=1e-4)
+    # icrs is a no-op pass-through
+    assert to_icrs(268.77, -29.25, "icrs") == (pytest.approx([268.77]), pytest.approx([-29.25]))
+
+
+def test_resolve_frame_aliases_and_errors() -> None:
+    assert resolve_frame("GALACTIC") == "galactic"
+    assert resolve_frame("gal") == "galactic"
+    assert resolve_frame("J2000") == "fk5"
+    assert resolve_frame("b1950") == "fk4"
+    with pytest.raises(QueryError, match="unknown frame"):
+        resolve_frame("supergalactic")
+
+
+def test_galactic_cone_finds_file_indexed_in_icrs(tmp_path: Path) -> None:
+    """A galactic query must hit a file whose rows are stored as ICRS ra/dec."""
+    ra_c, dec_c = 268.66289, -26.11349  # == l=3.45, b=-0.27
+    with Store(tmp_path / "i.duckdb") as store:
+        add_file(store, "s3://b/target.fits", *synth.patch(ra_c, dec_c, seed=21))
+        add_file(store, "s3://b/elsewhere.fits", *synth.patch(268.77, -29.25, seed=22))
+        index = Index(store)
+        gal = index.search(cone_moc(3.45, -0.27, 30 * u.arcsec, ORDER, "galactic"))
+        assert [r.uri for r in gal] == ["s3://b/target.fits"]
+        # same sky position expressed in ICRS gives the identical answer
+        icrs = index.search(cone_moc(ra_c, dec_c, 30 * u.arcsec, ORDER))
+        assert [r.uri for r in icrs] == [r.uri for r in gal]
+
+
+def test_galactic_and_icrs_cones_agree_exactly() -> None:
+    """Frame change is a rotation, so the MOC must be identical either way."""
+    ra, dec = to_icrs(3.45, -0.27, "galactic")
+    assert cone_moc(3.45, -0.27, 2 * u.arcmin, ORDER, "galactic") == cone_moc(
+        float(ra[0]), float(dec[0]), 2 * u.arcmin, ORDER
+    )
+
+
+def test_galactic_polygon_converts_all_vertices() -> None:
+    lon = [3.4, 3.5, 3.5, 3.4]
+    lat = [-0.32, -0.32, -0.22, -0.22]
+    gal = polygon_moc(lon, lat, ORDER, "galactic")
+    ra, dec = to_icrs(lon, lat, "galactic")
+    assert gal == polygon_moc(list(ra), list(dec), ORDER)
+    assert not gal.empty()
+
+
+def test_stcs_honours_galactic_frame() -> None:
+    """Regression: the frame token used to be parsed then ignored (treated as ICRS)."""
+    gal = parse_stcs("CIRCLE GALACTIC 3.45 -0.27 0.05", ORDER)
+    assert gal == cone_moc(3.45, -0.27, 0.05 * u.deg, ORDER, "galactic")
+    as_icrs = parse_stcs("CIRCLE ICRS 3.45 -0.27 0.05", ORDER)
+    assert gal != as_icrs
+    poly = parse_stcs("POLYGON GALACTIC 3.4 -0.32 3.5 -0.32 3.5 -0.22", ORDER)
+    assert poly == polygon_moc([3.4, 3.5, 3.5], [-0.32, -0.32, -0.22], ORDER, "galactic")
+    with pytest.raises(QueryError, match="requires a frame"):
+        parse_stcs("CIRCLE SUPERGALACTIC 1 2 3", ORDER)
+
+
 def test_coord_bbox_plain_and_wrapping() -> None:
     ra = np.array([10.0, 11.0, 12.0])
     dec = np.array([-1.0, 0.0, 1.0])
@@ -92,36 +159,37 @@ def test_coord_bbox_plain_and_wrapping() -> None:
 
 
 def test_bounding_box_is_superset_of_moc() -> None:
-    moc = cone_moc(268.77, -29.25, 0.5 * u.deg, ORDER)
+    # built in the index frame so the input values are the MOC's own values
+    moc = cone_moc(268.77, -29.25, 0.5 * u.deg, ORDER, INDEX_FRAME)
     box = bounding_box(moc)
-    assert box.dec_min < -29.75 and box.dec_max > -28.75
-    assert not box.ra_unbounded and not box.wraps
-    assert box.ra_min < 268.77 < box.ra_max
+    assert box.lat_min < -29.75 and box.lat_max > -28.75
+    assert not box.lon_unbounded and not box.wraps
+    assert box.lon_min < 268.77 < box.lon_max
 
 
 def test_bounding_box_flags_wrap_and_poles() -> None:
-    assert bounding_box(cone_moc(0.05, 0.0, 0.5 * u.deg, ORDER)).wraps
-    assert bounding_box(cone_moc(10.0, 89.9, 0.5 * u.deg, ORDER)).ra_unbounded
-    wide = bounding_box(cone_moc(30.0, 0.0, 60.0 * u.deg, ORDER))
-    # A 60 deg cone at the equator spans RA 330..90; the box must contain that.
-    assert wide.wraps and wide.ra_min < 330.0 and wide.ra_max > 90.0
-    assert wide.dec_min < -60.0 and wide.dec_max > 60.0
+    assert bounding_box(cone_moc(0.05, 0.0, 0.5 * u.deg, ORDER, INDEX_FRAME)).wraps
+    assert bounding_box(cone_moc(10.0, 89.9, 0.5 * u.deg, ORDER, INDEX_FRAME)).lon_unbounded
+    wide = bounding_box(cone_moc(30.0, 0.0, 60.0 * u.deg, ORDER, INDEX_FRAME))
+    # A 60 deg cone at the equator spans lon 330..90; the box must contain that.
+    assert wide.wraps and wide.lon_min < 330.0 and wide.lon_max > 90.0
+    assert wide.lat_min < -60.0 and wide.lat_max > 60.0
 
 
-def test_bounding_box_ra_halfwidth_never_under_covers_a_cone() -> None:
-    """The prefilter box must never clip a cone: RA half-width >= exact value."""
-    for dec_center in (0.0, 15.0, -30.0, 45.0, -60.0, 75.0, 88.0, -88.5):
+def test_bounding_box_lon_halfwidth_never_under_covers_a_cone() -> None:
+    """The prefilter box must never clip a cone: lon half-width >= exact value."""
+    for lat_center in (0.0, 15.0, -30.0, 45.0, -60.0, 75.0, 88.0, -88.5):
         for radius in (0.01, 0.1, 0.5, 2.0, 10.0, 30.0):
-            box = bounding_box(cone_moc(123.0, dec_center, radius * u.deg, ORDER))
-            assert box.dec_min <= max(dec_center - radius, -90.0)
-            assert box.dec_max >= min(dec_center + radius, 90.0)
-            if box.ra_unbounded:
+            box = bounding_box(cone_moc(123.0, lat_center, radius * u.deg, ORDER, INDEX_FRAME))
+            assert box.lat_min <= max(lat_center - radius, -90.0)
+            assert box.lat_max >= min(lat_center + radius, 90.0)
+            if box.lon_unbounded:
                 continue
-            half_width = ((box.ra_max - box.ra_min) % 360.0) / 2.0
-            denominator = np.cos(np.radians(dec_center))
+            half_width = ((box.lon_max - box.lon_min) % 360.0) / 2.0
+            denominator = np.cos(np.radians(lat_center))
             ratio = np.sin(np.radians(radius)) / denominator
             exact = 180.0 if ratio >= 1.0 else np.degrees(np.arcsin(ratio))
-            assert half_width >= exact, (dec_center, radius, half_width, exact)
+            assert half_width >= exact, (lat_center, radius, half_width, exact)
 
 
 def test_search_hits_and_misses(tmp_path: Path) -> None:

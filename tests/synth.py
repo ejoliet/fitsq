@@ -104,3 +104,52 @@ def patch(
     scale = max(np.cos(np.radians(dec_center)), 1e-6)
     ra = (ra_center + rng.uniform(-half, half, n) / scale) % 360.0
     return ra, dec
+
+
+def cell_centre_galactic(pixel: int) -> tuple[float, float]:
+    """Galactic l/b of a named cell's centre."""
+    from fitsq.naming import TILE_ORDER, cell_moc
+
+    centre = cell_moc(pixel, TILE_ORDER).barycenter().spherical
+    return float(centre.lon.deg), float(centre.lat.deg)
+
+
+def cell_centre_icrs(pixel: int) -> tuple[float, float]:
+    """ICRS ra/dec of a named cell's centre, for aiming test cones."""
+    from fitsq.query import to_icrs
+
+    lon, lat = cell_centre_galactic(pixel)
+    ra, dec = to_icrs(lon, lat, "galactic")
+    return float(ra[0]), float(dec[0])
+
+
+def cell_patch(pixel: int, n: int = 400, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+    """ICRS ra/dec of ``n`` random sources inside galactic HEALPix cell ``pixel``.
+
+    Mirrors the real bucket, where every row of ``cat-<pix>.fits`` lies inside
+    the galactic order-9 cell named by the file.
+    """
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+
+    from fitsq.naming import TILE_ORDER, cell_moc
+
+    cell = cell_moc(pixel, TILE_ORDER)
+    centre = cell.barycenter().spherical
+    l0 = float(centre.lon.deg)
+    b0 = float(centre.lat.deg)
+    scale = max(np.cos(np.radians(b0)), 1e-6)
+    rng = np.random.default_rng(seed)
+    keep_l: list[float] = []
+    keep_b: list[float] = []
+    while len(keep_l) < n:
+        draw = 4 * n
+        lon = l0 + rng.uniform(-0.1, 0.1, draw) / scale
+        lat = b0 + rng.uniform(-0.1, 0.1, draw)
+        inside = cell.contains_lonlat(lon * u.deg, lat * u.deg)
+        keep_l.extend(lon[inside].tolist())
+        keep_b.extend(lat[inside].tolist())
+    icrs = SkyCoord(
+        np.array(keep_l[:n]) * u.deg, np.array(keep_b[:n]) * u.deg, frame="galactic"
+    ).icrs
+    return np.asarray(icrs.ra.deg), np.asarray(icrs.dec.deg)

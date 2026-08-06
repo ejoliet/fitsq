@@ -39,8 +39,8 @@ def index_known_file(store: Store) -> S3Reader:
     row = result.row
     print(f"\n{KNOWN_FILE}: nrows={row.nrows} row_bytes={row.row_bytes} size={row.size}")
     print(
-        f"  bbox ra [{row.ra_min:.4f}, {row.ra_max:.4f}] "
-        f"dec [{row.dec_min:.4f}, {row.dec_max:.4f}] wraps={row.ra_wraps}"
+        f"  bbox ra [{row.lon_min:.4f}, {row.lon_max:.4f}] "
+        f"dec [{row.lat_min:.4f}, {row.lat_max:.4f}] wraps={row.lon_wraps}"
     )
     print(f"  sampled {reader.bytes_read / 1e6:.1f} MB")
     assert row.row_bytes == 91, "ground truth: NAXIS1 = 91"

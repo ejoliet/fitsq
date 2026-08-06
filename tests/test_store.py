@@ -22,11 +22,11 @@ def row(uri: str = "s3://b/a.fits", **kw: object) -> FileRow:
         "nrows": 10,
         "row_bytes": 91,
         "data_offset": 5760,
-        "ra_min": 1.0,
-        "ra_max": 2.0,
-        "dec_min": -1.0,
-        "dec_max": 1.0,
-        "ra_wraps": False,
+        "lon_min": 1.0,
+        "lon_max": 2.0,
+        "lat_min": -1.0,
+        "lat_max": 1.0,
+        "lon_wraps": False,
         "moc_json": '{"9": [1, 2]}',
     }
     base.update(kw)
@@ -56,10 +56,41 @@ def test_upsert_replaces_row_and_cards(tmp_path: Path) -> None:
 
 def test_file_rows_where_prefilter(tmp_path: Path) -> None:
     with Store(tmp_path / "i.duckdb") as store:
-        store.upsert_file(row("s3://b/1.fits", dec_min=10.0, dec_max=11.0))
-        store.upsert_file(row("s3://b/2.fits", dec_min=-40.0, dec_max=-39.0))
-        hits = store.file_rows("dec_max >= ? AND dec_min <= ?", [9.0, 12.0])
+        store.upsert_file(row("s3://b/1.fits", lat_min=10.0, lat_max=11.0))
+        store.upsert_file(row("s3://b/2.fits", lat_min=-40.0, lat_max=-39.0))
+        hits = store.file_rows("lat_max >= ? AND lat_min <= ?", [9.0, 12.0])
         assert [r.uri for r in hits] == ["s3://b/1.fits"]
+
+
+def test_upsert_files_batch_round_trips_awkward_card_text(tmp_path: Path) -> None:
+    """CSV staging must not turn '' into NULL, nor trip on quotes/commas."""
+    cards = [
+        (0, "SIMPLE", "T", ""),  # empty comment must stay '', not NULL
+        (1, "TTYPE1", "a,b", 'has "quotes", and a comma'),
+        (1, "HISTORY", "", "trailing spaces   "),
+        (1, "TFORM1", "1D", "back\\slash and 'single'"),
+    ]
+    with Store(tmp_path / "i.duckdb") as store:
+        store.upsert_files([(row("s3://b/1.fits"), cards), (row("s3://b/2.fits"), [])])
+        assert sorted(store.etags()) == ["s3://b/1.fits", "s3://b/2.fits"]
+        _, got = store.sql(
+            "SELECT hdu, card_key, card_value, card_comment FROM headers "
+            "WHERE uri = 's3://b/1.fits' ORDER BY card_key"
+        )
+        assert sorted(got) == sorted(cards)
+        _, nulls = store.sql("SELECT count(*) FROM headers WHERE card_value IS NULL")
+        assert nulls == [(0,)]
+
+
+def test_upsert_files_replaces_previous_batch(tmp_path: Path) -> None:
+    with Store(tmp_path / "i.duckdb") as store:
+        store.upsert_files([(row("s3://b/1.fits", nrows=1), [(0, "A", "1", "")])])
+        store.upsert_files([(row("s3://b/1.fits", nrows=2), [(0, "B", "2", "")])])
+        rows = store.file_rows()
+        assert len(rows) == 1 and rows[0].nrows == 2
+        _, cards = store.sql("SELECT card_key FROM headers")
+        assert cards == [("B",)]
+    assert Store(tmp_path / "i.duckdb").upsert_files([]) is None  # empty batch is a no-op
 
 
 def test_errors_and_status(tmp_path: Path) -> None:
@@ -102,8 +133,13 @@ def test_status_on_empty_index(tmp_path: Path) -> None:
 
 
 def test_upsert_rolls_back_on_failure(tmp_path: Path) -> None:
+    """A failed batch must leave the previous contents intact."""
     with Store(tmp_path / "i.duckdb") as store:
-        store.upsert_file(row())
+        store.upsert_file(row(), [(0, "KEEP", "1", "")])
+        # the same uri twice in one batch violates the files primary key
+        duplicate = [(row(etag="e3"), [(0, "NEW", "2", "")])] * 2
         with pytest.raises(duckdb.Error):
-            store.upsert_file(row(etag="e3"), [(0, "K", "v", object())])  # type: ignore[list-item]
+            store.upsert_files(duplicate)
         assert store.etags() == {"s3://b/a.fits": "e1"}
+        _, cards = store.sql("SELECT card_key FROM headers")
+        assert cards == [("KEEP",)]

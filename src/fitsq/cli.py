@@ -29,9 +29,17 @@ class Format(StrEnum):
     csv = "csv"
 
 
+class Frame(StrEnum):
+    icrs = "icrs"
+    galactic = "galactic"
+    fk5 = "fk5"
+    fk4 = "fk4"
+
+
 IndexOpt = Annotated[Path, typer.Option("--index", envvar="FITSQ_INDEX", help="index location")]
 AnonOpt = Annotated[bool, typer.Option("--anon", help="unsigned S3 access (public buckets)")]
 FormatOpt = Annotated[Format, typer.Option("--format", help="output format")]
+FrameOpt = Annotated[Frame, typer.Option("--frame", help="frame of the input coordinates")]
 
 
 def _open_store(path: Path, *, read_only: bool) -> Store:
@@ -84,7 +92,14 @@ def index(
     sample_rows: Annotated[int, typer.Option("--sample-rows", help="rows per window")] = 50_000,
     samples: Annotated[int, typer.Option("--samples", help="windows per file")] = 3,
     order: Annotated[int, typer.Option("--order", help="MOC max_depth")] = DEFAULT_ORDER,
-    dilate: Annotated[int, typer.Option("--dilate", help="border cells at max order")] = 1,
+    dilate: Annotated[int, typer.Option("--dilate", help="border cells (--sample only)")] = 1,
+    from_names: Annotated[
+        bool,
+        typer.Option(
+            "--from-names/--sample",
+            help="exact coverage from cat-<pix>.fits names (default), or by sampling rows",
+        ),
+    ] = True,
 ) -> None:
     """Crawl an S3 prefix and upsert per-file coverage into the index (resumable)."""
     opts = idx.CrawlOptions(
@@ -105,12 +120,26 @@ def index(
         )
 
     with _open_store(index_path, read_only=False) as store:
-        stats = idx.crawl(prefix, store, reader, opts, progress)
+        stats = idx.crawl(prefix, store, reader, opts, progress, from_names=from_names)
     typer.echo("", err=True)
+    mode = "exact, from filenames" if from_names else "sampled rows"
     typer.echo(
         f"indexed {stats.indexed}, skipped {stats.skipped}, failed {stats.failed} "
-        f"of {stats.total} files; {stats.bytes_read / 1e6:.1f} MB read"
+        f"of {stats.total} files; {stats.bytes_read / 1e6:.1f} MB read ({mode})"
     )
+    if stats.header_errors:
+        typer.echo(
+            f"  {stats.header_errors} file(s) indexed with unreadable headers: "
+            "coverage is exact, row counts are 0",
+            err=True,
+        )
+    if from_names and stats.failed:
+        typer.secho(
+            f"  {stats.failed} file(s) could not be indexed from their name — "
+            "the naming convention may have changed; re-run with --sample to compare",
+            fg="yellow",
+            err=True,
+        )
     for uri, error in stats.errors[:10]:
         typer.echo(f"  error {uri}: {error}", err=True)
     if len(stats.errors) > 10:
@@ -120,24 +149,31 @@ def index(
 # ignore_unknown_options so a negative declination ("-29.25") is not parsed as a flag.
 @app.command(context_settings={"ignore_unknown_options": True})
 def cone(
-    ra: Annotated[float, typer.Argument(help="right ascension, degrees")],
-    dec: Annotated[float, typer.Argument(help="declination, degrees")],
+    lon: Annotated[float, typer.Argument(help="longitude: ra, or l with --frame galactic")],
+    lat: Annotated[float, typer.Argument(help="latitude: dec, or b with --frame galactic")],
     radius: Annotated[str, typer.Argument(help="e.g. 30arcsec, 2arcmin, 0.5deg, or bare number")],
     index_path: IndexOpt = DEFAULT_INDEX,
     unit: Annotated[str, typer.Option("--unit", help="unit for a bare radius")] = "deg",
+    frame: FrameOpt = Frame.icrs,
     fmt: FormatOpt = Format.text,
 ) -> None:
-    """List files covering a cone."""
-    _run_query(index_path, fmt, lambda order: cone_moc(ra, dec, parse_angle(radius, unit), order))
+    """List files covering a cone, in ICRS (default) or galactic coordinates."""
+    _run_query(
+        index_path,
+        fmt,
+        lambda order: cone_moc(lon, lat, parse_angle(radius, unit), order, frame.value),
+    )
 
 
 @app.command()
 def region(
-    stcs: Annotated[str, typer.Argument(help="STC-S: 'POLYGON ICRS ...' or 'CIRCLE ICRS ...'")],
+    stcs: Annotated[
+        str, typer.Argument(help="STC-S, e.g. 'POLYGON ICRS ...' or 'CIRCLE GALACTIC l b r'")
+    ],
     index_path: IndexOpt = DEFAULT_INDEX,
     fmt: FormatOpt = Format.text,
 ) -> None:
-    """List files covering an STC-S region."""
+    """List files covering an STC-S region. The frame token is honoured."""
     _run_query(index_path, fmt, lambda order: parse_stcs(stcs, order))
 
 
@@ -186,7 +222,7 @@ def validate(
             )
         typer.echo(f"{len(violations)}/{checked} files under-covered; raise --samples and re-index")
         raise typer.Exit(1)
-    typer.secho(f"OK: {checked} files validated, sampled MOCs cover all rows", fg="green")
+    typer.secho(f"OK: {checked} files validated, stored MOCs cover all rows", fg="green")
 
 
 if __name__ == "__main__":  # pragma: no cover

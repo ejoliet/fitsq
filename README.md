@@ -20,9 +20,43 @@
 | Table layout | 12 cols: `source_id` (K), `ra`/`dec`/8 fluxes (D), `type` (3A); NAXIS1=91 | fixed numpy big-endian dtype |
 | Primary header | empty (SIMPLE/BITPIX/NAXIS=0/EXTEND) | header index is trivial EAV |
 | Row order | random within tile; head/tail 50k-row samples give identical footprint | sampling is sufficient; chunk map useless |
-| Tile size | ~0.15° squares; straddles order-8 HEALPix boundaries | filenames are NOT HEALPix pixels (ruled out nest+ring, orders 8–10) |
+| Tile size | one order-9 HEALPix cell (~0.115° side) | see below |
+| **Filenames ARE HEALPix pixels** | `cat-<pix>.fits` where `<pix>` is the **nside 512 (order 9) NESTED** index of the tile, **in GALACTIC coordinates** | coverage is derivable from the filename alone — verified 2495/2495 |
 | Corpus | **2495 files, 204.9 GB total** | — |
 | File size | **bimodal: median 3.5 MB (~40k rows); 291 files 400 MB–1.2 GB; max 13.2M rows** | see below |
+
+### Filename → coverage (discovered 2026-08-05)
+
+`cat-1113599.fits` is order-9 NESTED HEALPix pixel `1113599` **in galactic coordinates**. Evidence:
+
+- suffix == galactic order-9 NESTED pixel of the measured tile centre for **2495/2495** files (ICRS: 0/2495)
+- 4 files × 3000 rows: **100%** of rows fall inside their own filename cell, no spill into neighbours
+- pixel 1113599's cell centre (l=1.4063, b=−1.2684) matches the measured tile centre (l=1.4077, b=−1.2686) to 0.0014°
+
+```python
+from mocpy import MOC; import astropy.units as u
+from astropy.coordinates import SkyCoord
+g = SkyCoord(ra=268.4683*u.deg, dec=-28.3813*u.deg).galactic
+int(MOC.from_lonlat(g.l, g.b, max_norder=9).flatten()[0])   # -> 1113599
+```
+
+**This is how the index is built.** `fitsq index` derives coverage from the filename by default (`--from-names`): exact, one cell, no dilation, and no row reads — only ~8.6 KB of header per file for the row counts. The sampling crawl remains available as `fitsq index --sample` for cross-checking.
+
+Because the convention is reverse-engineered rather than documented by the producer, two guards are wired in:
+
+- a filename that does not parse is a **failure**, never a silent fallback — the file is left out of the index and reported, so a change in naming surfaces immediately;
+- `fitsq validate` re-reads the rows and fails if a stored MOC does not cover them, which is exactly what a file named for the wrong cell would look like.
+
+### Sky footprint (all 2495 tiles probed 2026-08-05)
+
+The corpus is **two disjoint fields**, and the split coincides exactly with the file-size split:
+
+| Field | Tiles | Galactic extent | Size / rows per file |
+|---|---|---|---|
+| Bulge (GBTDS-like) | 294 | l [−0.794, +1.671], b [−2.014, +0.377] | 322 MB – 1.2 GB, 3.5–13.2 M rows |
+| Southern | 2201 | l [−61.4, −35.1], b [−76.7, −63.8] | 0–4.3 MB, 0–35 k rows |
+
+Nothing lies between them. Useful consequence for galactic-coordinate queries: **the bulge field stops at l ≈ +1.67**, so a cone at, say, `l=3.45, b=−0.27` is ~1.8° beyond the coverage edge and correctly returns nothing — the nearest tile centre is 1.94° away (`cat-1157294.fits`). Cross-checked via the naming rule: that position is order-9 galactic pixel `1157513`, and `cat-1157513.fits` does not exist in the bucket.
 
 > ⚠️ **The corpus is bimodal, not uniform.** An earlier revision of this spec generalized `cat-1113533.fits` (5.88M rows, 535 MB) to every file. In reality **88% of files (2201) hold ≤ 150k rows**, i.e. fewer than `--samples × --sample-rows`. For those the indexer reads the **whole table** rather than sampling windows — the former "Open Question 3" path is the *common* case, and those files are indexed exactly rather than approximately. A full crawl at default settings reads **≈11.1 GB, 5.4% of the corpus**.
 
@@ -47,7 +81,8 @@ list_objects_v2 (paginated)                cone/region args
 ```
 
 - **Index is the product.** `index.duckdb` (~2 MB for 5k files) contains everything; queries never touch S3.
-- **Dilation** guards against sparse sources missed by sampling: one HEALPix cell border at max order (~6.9′ at order 9 vs 9′ tiles — generous).
+- **Coverage comes from the filename** by default — exact, no dilation. `--sample` falls back to reading rows, where **dilation** guards against sparse sources missed by sampling: one HEALPix cell border at max order.
+- **The index is stored in galactic coordinates** (`meta.moc_frame`), because that is the frame the tiling is defined in. Queries in any supported frame are rotated into it, which is lossless. The `files` bbox columns are `lon_*`/`lat_*` for that reason.
 - **Resumable**: files already in the index (same URI + same ETag) are skipped; re-running `index` is the incremental update path.
 
 ## Stack (as built)
@@ -103,12 +138,20 @@ fitsq/
 uv sync
 
 # 1. Build the index (one-time, resumable — rerun to continue/update)
+#    Default: exact coverage from filenames, headers only (~21 MB, seconds).
 uv run fitsq index s3://stpubdata/roman/nexus/soc_simulations/input_catalogs/ --anon
+
+#    Cross-check by sampling rows instead (~11 GB, the original path)
+uv run fitsq index s3://stpubdata/roman/nexus/soc_simulations/input_catalogs/ --anon --sample
 
 # 2. Query — instant, offline
 uv run fitsq cone 268.77 -29.25 30arcsec
 uv run fitsq cone 268.77 -29.25 0.05 --unit deg --format json
 uv run fitsq region "POLYGON ICRS 268.7 -29.3 268.9 -29.3 268.9 -29.1 268.7 -29.1"
+
+# Galactic l/b input — same sky, same answer
+uv run fitsq cone 1.4077 -1.2686 1arcmin --frame galactic
+uv run fitsq region "CIRCLE GALACTIC 1.4077 -1.2686 0.02"
 uv run fitsq sql "SELECT count(*), sum(nrows) FROM files"
 uv run fitsq status
 uv run fitsq validate --n 10 --anon
@@ -120,13 +163,15 @@ uv run fitsq validate --n 10 --anon
 |---|---|---|---|---|
 | `FITSQ_INDEX` / `--index` | path | `~/.cache/fitsq/index.duckdb` | all | index location |
 | `--anon` | flag | off | `index`, `validate` | unsigned S3 (public buckets); else boto3 default chain |
+| `--from-names` / `--sample` | flag | `--from-names` | `index` | exact coverage from `cat-<pix>.fits` names, or by sampling rows |
 | `--workers` | int | 16 | `index` | crawl parallelism |
-| `--sample-rows` | int | 50000 | `index` | rows per sample window |
-| `--samples` | int | 3 | `index` | windows per file (head/middle/tail; >3 → evenly spaced) |
-| `--order` | int | 9 | `index` | MOC max_depth |
-| `--dilate` | int | 1 | `index` | border cells at max order (0 disables) |
+| `--sample-rows` | int | 50000 | `index` | rows per sample window (`--sample` only) |
+| `--samples` | int | 3 | `index` | windows per file (`--sample` only) |
+| `--order` | int | 9 | `index` | MOC max_depth / HEALPix order of the tiling |
+| `--dilate` | int | 1 | `index` | border cells at max order (`--sample` only; name-derived coverage is exact) |
 | `--format` | enum | `text` | `cone`, `region` | `text` \| `json` \| `csv` |
 | `--unit` | str | `deg` | `cone` | unit for a bare numeric radius |
+| `--frame` | enum | `icrs` | `cone` | `icrs` \| `galactic` \| `fk5` \| `fk4` — frame of the input longitude/latitude |
 | `--n` | int | 10 | `validate` | files to full-read |
 | `--seed` | int | none | `validate` | deterministic file choice |
 
@@ -139,11 +184,18 @@ Exit codes: **0** success (including zero matches), **1** index missing / empty 
 ### `fitsq index <s3-prefix>`
 Crawl + upsert. Skips URIs whose ETag matches the stored one. Prints progress (`n/total, MB read, ETA`) to stderr. Exit 0 even with per-file failures; failures logged to `crawl_errors` and summarized (first 10 shown).
 
-### `fitsq cone <ra> <dec> <radius>`
-Radius accepts `30arcsec`, `2arcmin`, `0.5deg`, or a bare float with `--unit`. Output: matching `s3://` URIs, one per line (text) or `{uri, nrows, size}` (json/csv). Negative declinations work as written — the command sets `ignore_unknown_options` so click does not read `-29.25` as a flag.
+Coverage comes from filenames by default and from sampled rows under `--sample`. In the default mode:
+
+- an unparseable filename is a **failure** — the file is not indexed, and the summary warns that the naming convention may have changed;
+- an unreadable *header* is not fatal: coverage is exact regardless, so the file is indexed with `nrows = 0` and the problem is reported.
+
+### `fitsq cone <lon> <lat> <radius>`
+Radius accepts `30arcsec`, `2arcmin`, `0.5deg`, or a bare float with `--unit`. Output: matching `s3://` URIs, one per line (text) or `{uri, nrows, size}` (json/csv). Negative latitudes work as written — the command sets `ignore_unknown_options` so click does not read `-29.25` as a flag.
+
+`<lon> <lat>` are ICRS ra/dec by default, or galactic `l`/`b` with `--frame galactic` (also `fk5`, `fk4`). Coordinates are converted to ICRS before the MOC is built, because MOCs are ICRS by the Space MOC standard. Frame changes among these systems are rotations, so a cone's radius and a polygon's great-circle edges survive unchanged — converting the centre or the vertices is sufficient.
 
 ### `fitsq region "<STC-S string>"`
-v1 supports `POLYGON <frame> lon lat ...` and `CIRCLE <frame> lon lat r`, where frame is `ICRS`/`FK5`/`J2000` and is **required**. Other STC-S constructs are rejected with a clear error.
+v1 supports `POLYGON <frame> lon lat ...` and `CIRCLE <frame> lon lat r`. The frame token is **required and honoured**: `ICRS`, `FK5`/`J2000`, `FK4`/`B1950`, `GALACTIC`/`GAL`. Other STC-S constructs are rejected with a clear error.
 
 ### `fitsq sql "<query>"`
 Pass-through to the DuckDB index (read-only connection), CSV out. Note `at` is a DuckDB reserved word: `SELECT uri, "at" FROM crawl_errors`.
@@ -160,17 +212,20 @@ Full-reads N random indexed files, rebuilds true MOCs, asserts `true_moc ⊆ sto
 CREATE TABLE files (
   uri TEXT PRIMARY KEY, etag TEXT, size BIGINT,
   nrows BIGINT, row_bytes INT, data_offset BIGINT,
-  ra_min DOUBLE, ra_max DOUBLE, dec_min DOUBLE, dec_max DOUBLE,  -- bbox prefilter
-  ra_wraps BOOLEAN,                                              -- box crosses RA=0
-  moc_json TEXT,                 -- mocpy to_string(format="json")
+  -- bbox prefilter, in the index frame (meta 'moc_frame'), degrees
+  lon_min DOUBLE, lon_max DOUBLE, lat_min DOUBLE, lat_max DOUBLE,
+  lon_wraps BOOLEAN,             -- box crosses lon=0
+  moc_json TEXT,                 -- mocpy to_string(format="json"), index frame
   indexed_at TIMESTAMP
 );
 CREATE TABLE headers (uri TEXT, hdu INT, card_key TEXT, card_value TEXT, card_comment TEXT);
-CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);   -- schema_version, prefix, sample params
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE crawl_errors (uri TEXT, error TEXT, "at" TIMESTAMP);
 ```
 
-`meta.schema_version` is `1`; a mismatch refuses to open with a rebuild message.
+`meta` carries `schema_version`, `prefix`, `moc_frame` (`galactic`), `coverage` (`filename` or `sampled`), `order`, the sampling parameters, and `last_crawl`.
+
+`meta.schema_version` is `2`; a mismatch refuses to open with a rebuild message. Version 2 renamed the bbox columns from `ra_*`/`dec_*`, because the stored box and MOC are in the index frame, not ICRS.
 
 ## Error Handling
 
@@ -221,17 +276,17 @@ Measured 2026-08-05 on this implementation.
 | Acceptance criterion | Result |
 |---|---|
 | Cone (268.77, −29.25) returns `cat-1113533.fits`; 10° away returns nothing | ✅ real bucket |
-| `validate` passes (true coverage ⊆ stored MOC) | ✅ real file: 13.7 MB sampled, confirmed by a 548 MB full read, zero violations |
+| `validate` passes (true coverage ⊆ stored MOC) | ✅ name-derived index: `--n 3` full-read on the real bucket, zero violations. Also ✅ for the sampling path: 13.7 MB sampled, confirmed by a 548 MB full read |
 | Query latency < 50 ms warm | ✅ median 10.5 ms, p95 12.7 ms (5k-file index); 283-file 2° cone in 29.1 ms |
 | Index ≤ 20 MB for ~5k files | ✅ 1.85 MB |
 | Coverage ≥ 80%, `ruff` + `mypy --strict` clean | ✅ 95.8%, both clean, 61 passed / 1 skipped |
 | Resumable crawl | ✅ rerun skips unchanged ETags with zero data reads; changed ETag re-indexes |
-| `uvx --from . fitsq index …` completes on the real bucket | ⬜ **not run** — full 2495-file crawl pending |
+| Full crawl of the real bucket | ✅ all **2495 files, 0 errors, 57.5 MB read, 1m00s** (`--from-names`); 2.0 MB index over 2.23 billion catalog rows |
 
 `cat-1113533.fits` as indexed: `nrows=5875592`, `row_bytes=91`, `size=534686400`, bbox ra [268.7017, 268.8491] dec [−29.3271, −29.1756] — matches the probed ground truth.
 
 ## Next Steps
 
-1. Run the real crawl from a laptop (evening job): ~2495 files, ≈11.1 GB read. Commit nothing containing the index — it is a cache artifact (`*.duckdb` is gitignored).
-2. Run `fitsq validate --n 10` against the full index; if clean, freeze v1.
+1. Build the index whenever you need it — it is now a one-minute operation, so it need not be scheduled: `fitsq index <prefix> --anon`. Commit nothing containing the index; it is a cache artifact (`*.duckdb` is gitignored).
+2. Run `fitsq validate --n 10 --anon` periodically (it full-reads whole files, up to 1.2 GB each) to keep the naming convention under watch; if clean, freeze v1.
 3. Decide v2 scope (row retrieval) based on actual usage.

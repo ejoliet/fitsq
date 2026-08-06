@@ -4,15 +4,36 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import astropy.units as u
 import numpy as np
+from astropy.coordinates import SkyCoord
 from mocpy import MOC
 
 from .store import FileRow, Store
 
 DEFAULT_ORDER = 9
+
+#: Frame the index is stored in. Galactic, because catalog filenames encode a
+#: galactic HEALPix cell (see :mod:`fitsq.naming`): keeping the index in that
+#: frame makes name-derived coverage *exact* — one cell, no rotation, no
+#: dilation. mocpy does plain spherical maths on lon/lat and is frame-agnostic,
+#: so a MOC of galactic values is as valid as one of ICRS values; only the two
+#: sides of a comparison have to agree, which is what this constant enforces.
+INDEX_FRAME = "galactic"
+
+#: Accepted frame names (query input) -> astropy frame.
+FRAME_ALIASES = {
+    "icrs": "icrs",
+    "fk5": "fk5",
+    "j2000": "fk5",
+    "fk4": "fk4",
+    "b1950": "fk4",
+    "galactic": "galactic",
+    "gal": "galactic",
+}
 
 _UNIT_ALIASES = {
     "deg": u.deg,
@@ -55,18 +76,77 @@ def parse_angle(text: str, default_unit: str = "deg") -> u.Quantity:
     return value * unit
 
 
-def cone_moc(ra_deg: float, dec_deg: float, radius: u.Quantity, order: int) -> MOC:
-    return MOC.from_cone(lon=ra_deg * u.deg, lat=dec_deg * u.deg, radius=radius, max_depth=order)
+def resolve_frame(name: str) -> str:
+    """Map a user-supplied frame name to an astropy frame, or raise."""
+    frame = FRAME_ALIASES.get(name.strip().lower())
+    if frame is None:
+        raise QueryError(f"unknown frame {name!r}; supported: {', '.join(sorted(FRAME_ALIASES))}")
+    return frame
 
 
-def polygon_moc(lon_deg: list[float], lat_deg: list[float], order: int) -> MOC:
-    return MOC.from_polygon(
-        lon=np.asarray(lon_deg) * u.deg, lat=np.asarray(lat_deg) * u.deg, max_depth=order
+def convert(
+    lon_deg: float | Sequence[float] | np.ndarray,
+    lat_deg: float | Sequence[float] | np.ndarray,
+    from_frame: str,
+    to_frame: str = INDEX_FRAME,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert longitude/latitude degrees between frames.
+
+    Frame changes among these systems are rotations, so a cone's radius and a
+    polygon's great-circle edges are preserved: converting the centre or the
+    vertices is enough, no re-tessellation needed.
+    """
+    src = resolve_frame(from_frame)
+    dst = resolve_frame(to_frame)
+    lon = np.atleast_1d(np.asarray(lon_deg, dtype=float))
+    lat = np.atleast_1d(np.asarray(lat_deg, dtype=float))
+    if src == dst:
+        return lon, lat
+    out = getattr(SkyCoord(lon * u.deg, lat * u.deg, frame=src), dst)
+    spherical = out.spherical
+    return np.atleast_1d(spherical.lon.deg), np.atleast_1d(spherical.lat.deg)
+
+
+def to_icrs(
+    lon_deg: float | Sequence[float] | np.ndarray,
+    lat_deg: float | Sequence[float] | np.ndarray,
+    frame: str = "icrs",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert longitude/latitude in ``frame`` to ICRS degrees."""
+    return convert(lon_deg, lat_deg, frame, "icrs")
+
+
+def to_index_frame(
+    lon_deg: float | Sequence[float] | np.ndarray,
+    lat_deg: float | Sequence[float] | np.ndarray,
+    frame: str = "icrs",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert query/row coordinates into the frame the index is stored in."""
+    return convert(lon_deg, lat_deg, frame, INDEX_FRAME)
+
+
+def cone_moc(
+    lon_deg: float, lat_deg: float, radius: u.Quantity, order: int, frame: str = "icrs"
+) -> MOC:
+    """Cone MOC in the index frame. Input is read in ``frame`` (e.g. galactic l/b)."""
+    lon, lat = to_index_frame(lon_deg, lat_deg, frame)
+    return MOC.from_cone(
+        lon=float(lon[0]) * u.deg, lat=float(lat[0]) * u.deg, radius=radius, max_depth=order
     )
 
 
+def polygon_moc(lon_deg: list[float], lat_deg: list[float], order: int, frame: str = "icrs") -> MOC:
+    """Polygon MOC in the index frame, from vertices given in ``frame``."""
+    lon, lat = to_index_frame(lon_deg, lat_deg, frame)
+    return MOC.from_polygon(lon=lon * u.deg, lat=lat * u.deg, max_depth=order)
+
+
 def parse_stcs(text: str, order: int) -> MOC:
-    """v1 STC-S subset: ``POLYGON ICRS lon lat ...`` and ``CIRCLE ICRS lon lat r``."""
+    """v1 STC-S subset: ``POLYGON <frame> lon lat ...`` and ``CIRCLE <frame> lon lat r``.
+
+    Frame is required and honoured: coordinates are converted from it into the
+    index frame rather than silently taken as already being in it.
+    """
     tokens = text.replace(",", " ").split()
     if not tokens:
         raise QueryError("empty region string")
@@ -76,10 +156,12 @@ def parse_stcs(text: str, order: int) -> MOC:
             f"unsupported STC-S construct {shape!r}; v1 supports POLYGON and CIRCLE only"
         )
     rest = tokens[1:]
-    if rest and rest[0].upper() in ("ICRS", "FK5", "J2000"):
-        rest = rest[1:]
-    else:
-        raise QueryError(f"{shape} requires a frame, e.g. '{shape} ICRS ...'")
+    if not rest or rest[0].lower() not in FRAME_ALIASES:
+        raise QueryError(
+            f"{shape} requires a frame, e.g. '{shape} ICRS ...' or '{shape} GALACTIC ...'"
+        )
+    frame = rest[0]
+    rest = rest[1:]
     try:
         numbers = [float(token) for token in rest]
     except ValueError as exc:
@@ -88,55 +170,58 @@ def parse_stcs(text: str, order: int) -> MOC:
         if len(numbers) != 3:
             raise QueryError("CIRCLE needs 3 numbers: lon lat radius (deg)")
         lon, lat, radius = numbers
-        return cone_moc(lon, lat, radius * u.deg, order)
+        return cone_moc(lon, lat, radius * u.deg, order, frame)
     if shape == "POLYGON":
         if len(numbers) < 6 or len(numbers) % 2:
             raise QueryError("POLYGON needs >= 3 lon/lat pairs")
-        return polygon_moc(numbers[0::2], numbers[1::2], order)
+        return polygon_moc(numbers[0::2], numbers[1::2], order, frame)
     raise QueryError(f"unsupported STC-S construct {shape!r}")  # pragma: no cover
 
 
 @dataclass(frozen=True)
 class BBox:
-    """Conservative lon/lat bounds of a query region. ``wraps`` crosses RA=0."""
+    """Conservative lon/lat bounds of a region. ``wraps`` crosses lon=0."""
 
-    ra_min: float
-    ra_max: float
-    dec_min: float
-    dec_max: float
+    lon_min: float
+    lon_max: float
+    lat_min: float
+    lat_max: float
     wraps: bool
-    ra_unbounded: bool = False
+    lon_unbounded: bool = False
 
 
 def bounding_box(moc: MOC) -> BBox:
     """Bounding box of a MOC, via its bounding cone (barycenter + max vertex distance).
 
-    Always a superset of the MOC, so it is safe as a prefilter.
+    Always a superset of the MOC, so it is safe as a prefilter. Values are in
+    whatever frame the MOC carries — mocpy labels coordinates ICRS regardless,
+    so the numbers are read positionally rather than trusted as ra/dec.
     """
     center = moc.barycenter()
     radius_deg = float(moc.largest_distance_from_coo_to_vertices(center).to_value(u.deg))
-    ra = float(center.icrs.ra.deg)
-    dec = float(center.icrs.dec.deg)
-    dec_min = dec - radius_deg
-    dec_max = dec + radius_deg
-    worst_dec = max(abs(min(dec_min, 90.0)), abs(max(dec_max, -90.0)))
-    if dec_min <= -90.0 or dec_max >= 90.0 or radius_deg >= 90.0 or worst_dec >= 89.0:
-        return BBox(0.0, 360.0, max(dec_min, -90.0), min(dec_max, 90.0), False, True)
-    dra = radius_deg / math.cos(math.radians(worst_dec))
-    if dra >= 180.0:
-        return BBox(0.0, 360.0, dec_min, dec_max, False, True)
-    lo = (ra - dra) % 360.0
-    hi = (ra + dra) % 360.0
-    return BBox(lo, hi, dec_min, dec_max, lo > hi)
+    spherical = center.spherical
+    lon = float(spherical.lon.deg)
+    lat = float(spherical.lat.deg)
+    lat_min = lat - radius_deg
+    lat_max = lat + radius_deg
+    worst_lat = max(abs(min(lat_min, 90.0)), abs(max(lat_max, -90.0)))
+    if lat_min <= -90.0 or lat_max >= 90.0 or radius_deg >= 90.0 or worst_lat >= 89.0:
+        return BBox(0.0, 360.0, max(lat_min, -90.0), min(lat_max, 90.0), False, True)
+    dlon = radius_deg / math.cos(math.radians(worst_lat))
+    if dlon >= 180.0:
+        return BBox(0.0, 360.0, lat_min, lat_max, False, True)
+    lo = (lon - dlon) % 360.0
+    hi = (lon + dlon) % 360.0
+    return BBox(lo, hi, lat_min, lat_max, lo > hi)
 
 
 def _where(bbox: BBox) -> tuple[str, list[float | bool]]:
-    clauses = ["dec_max >= ?", "dec_min <= ?"]
-    params: list[float | bool] = [bbox.dec_min, bbox.dec_max]
-    if not bbox.ra_unbounded:
+    clauses = ["lat_max >= ?", "lat_min <= ?"]
+    params: list[float | bool] = [bbox.lat_min, bbox.lat_max]
+    if not bbox.lon_unbounded:
         # File boxes that wrap RA=0 are kept unconditionally: cheap and conservative.
-        clauses.append("(ra_wraps OR CAST(? AS BOOLEAN) OR (ra_max >= ? AND ra_min <= ?))")
-        params += [bbox.wraps, bbox.ra_min, bbox.ra_max]
+        clauses.append("(lon_wraps OR CAST(? AS BOOLEAN) OR (lon_max >= ? AND lon_min <= ?))")
+        params += [bbox.wraps, bbox.lon_min, bbox.lon_max]
     return " AND ".join(clauses), params
 
 
